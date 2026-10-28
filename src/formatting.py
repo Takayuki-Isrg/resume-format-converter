@@ -26,9 +26,13 @@ def format_period(value):
     return result + (" " + note if note else "")
 
 
-def format_technologies(value):
+def format_items(value):
     # Preserve order, duplicates and punctuation within each original line.
     return "、".join(line.strip() for line in value.splitlines() if line.strip())
+
+
+def format_technologies(value):
+    return format_items(value)
 
 
 def format_project(project):
@@ -36,5 +40,5 @@ def format_project(project):
             f"期間：{format_period(project.period)}\n\n"
             f"【概要】\n{project.overview}\n\n"
             f"【担当業務】\n{project.duties}\n\n"
-            f"【担当工程】\n{project.stages}\n\n"
+            f"【担当工程】\n{format_items(project.stages)}\n\n"
             f"【技術要素】\n{format_technologies(project.technologies)}\n\n---")

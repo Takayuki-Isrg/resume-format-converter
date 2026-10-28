@@ -36,7 +36,7 @@ def test_explanation_and_stages_preserve_repeated_words(tmp_path):
     assert "単体テスト" in p.duties and "単体テスト" in p.stages
     text=format_project(p)
     assert text.count("単体テスト") == 2
-    assert "【担当工程】\n単体テスト\n結合テスト" in text
+    assert "【担当工程】\n単体テスト、結合テスト\n\n" in text
     assert "期間：2024年9月～2024年11月（3ヶ月） ※12月は自宅待機" in text
     assert "【技術要素】\nC-shell、PL/SQL、Python、Linux、Oracle" in text
     # Before/after preserve project count and the exact duty strings in order.
@@ -96,3 +96,16 @@ def test_headerless_unknown_shape_is_not_inferred(tmp_path):
     result=read_projects(source)
     assert len(result.projects)==1
     assert any("表2" in w and "対象外" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize(("stages", "expected"), [
+    ("基本設計\n製造\n単体テスト\n結合テスト", "基本設計、製造、単体テスト、結合テスト"),
+    ("単体テスト\n\n 結合テスト \n単体テスト", "単体テスト、結合テスト、単体テスト"),
+    ("運用保守", "運用保守"),
+    ("", ""),
+])
+def test_stages_on_one_line(stages, expected):
+    from src.readfiles import Project
+    text = format_project(Project(stages=stages))
+    actual = text.split("【担当工程】\n", 1)[1].split("\n\n【技術要素】", 1)[0]
+    assert actual == expected

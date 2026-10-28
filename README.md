@@ -111,9 +111,9 @@ pymanager exec -V:3.11 -m venv .venv
 ```powershell
 Copy-Item mask-config.example.json mask-config.local.json
 # mask-config.local.json の配列へマスクする値を登録
-python -m src.transfer "input.docx"
+.\.venv\Scripts\python.exe -m src.transfer "input.docx"
 # 別の設定を使用する場合
-python -m src.transfer "input.docx" --config "private/mask-config.json"
+.\.venv\Scripts\python.exe -m src.transfer "input.docx" --config "private/mask-config.json"
 ```
 
 ```json

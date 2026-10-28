@@ -37,7 +37,7 @@ GitHubの「Code」→「Download ZIP」からダウンロードして展開し�
 取得元URL → https://github.com/Takayuki-Isrg/resume-format-converter
 
 Gitを利用する場合は、GitHubの「Code」からコピーした実際のURLを使ってクローンしても構いません。
-```bash
+```powershell
 git clone https://github.com/Takayuki-Isrg/resume-format-converter.git
 cd resume-format-converter
 ```
@@ -74,8 +74,8 @@ pymanager exec -V:3.11 -m venv .venv
 このコマンドはPython標準ライブラリだけで動作し、外部通信・OCR・LLM・APIキーを使用しません。
 
 ```powershell
-python -m src.transfer "input.docx"
-python -m src.transfer "input.docx" --mask-name "山田 太郎" --mask-name "佐藤 花子"
+.\.venv\Scripts\python -m src.transfer "input.docx"
+.\.venv\Scripts\python -m src.transfer "input.docx" --mask-name "山田 太郎" --mask-name "佐藤 花子"
 ```
 
 入力と同じフォルダへ `input_converted_YYYYMMDD_HHMMSS_ffffff.txt` を作成します。
@@ -147,7 +147,7 @@ python -m pytest tests/test_docx_transfer.py -q
 
 | 項目 | 所要時間 |
 |---|---:|
-| Before：手作業（1案件約5分 × 17案件、単純計算） | 約85分 |
+| Before：手作業（1案件約5分 × 17案件、**単純計算**） | 約85分 |
 | After：ツール利用（17案件全体、実測） | 約15分 |
 | 削減時間 | 約70分 |
 | 削減率 | 約82.4% |

@@ -2,24 +2,64 @@
 
 Word職務経歴書の表から案件情報を抽出し、転職サイト向けテキストへ変換するPythonツールです。
 
-## セットアップ
+## セットアップ（Windows / PowerShell）
 
-Python 3.11以上を使用してください。リポジトリのルートで実行します。
-実行には追加ライブラリのインストールは不要です。
+Python 3.11以上で動作します。以下はPython 3.11を使う手順です。
+変換の実行には追加ライブラリのインストールは不要です。
 
-GitHubのリポジトリをクローンするか、ZIPをダウンロードして展開してください。
-取得したフォルダ（README.mdがある場所）をターミナルで開き、次を実行します。
+### 1. Pythonをインストール（初回のみ）
+
+Pythonが未導入の場合、PowerShellで公式のPython Install Managerをインストールします。
+既にPython 3.11以上を利用できる場合は、この手順を省略できます。
 
 ```powershell
-# GitHubの「Code」からリポジトリURLをコピーして
-# <URL> を実際のリポジトリURLに置き換えてください。
-git clone <リポジトリURL>
+winget install --id 9NQ7512CXL7T --exact --source msstore
+```
+
+完了したらPowerShellを開き直し、Python 3.11のインストールと確認を行います。
+`pymanager` はPython Install Managerのコマンドです。
+
+```powershell
+pymanager install 3.11
+pymanager exec -V:3.11 --version
+```
+
+`winget` が使えない場合は、[Python公式サイト](https://www.python.org/downloads/windows/)から
+Python Install Managerをインストールしてください。
+詳細は [Python公式のWindows向け手順](https://docs.python.org/3/using/windows.html) を参照してください。
+
+### 2. プロジェクトを取得
+
+GitHubの「Code」→「Download ZIP」からダウンロードして展開します（Gitのインストールは不要）。
+取得したフォルダのうち、README.mdがある場所をエクスプローラーで開き、
+アドレスバーに `powershell` と入力してEnterを押すと、その場所でPowerShellを開けます。
+
+取得元URL → https://github.com/Takayuki-Isrg/resume-format-converter
+
+Gitを利用する場合は、GitHubの「Code」からコピーした実際のURLを使ってクローンしても構いません。
+```bash
+git clone https://github.com/Takayuki-Isrg/resume-format-converter.git
 cd resume-format-converter
-python -m venv .venv
+```
+
+### 3. 仮想環境を作成して実行
+
+```powershell
+pymanager exec -V:3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m src.transfer "input.docx"
 ```
 
-テスト用の依存関係と実行:
+既存のPythonを使う場合は、最初の行を `python -m venv .venv` に置き換えてください。
+`input.docx` は変換したいWordファイルのパスに置き換えます。空白を含むパスも二重引用符で囲んでください。
+仮想環境の有効化やPowerShellの実行ポリシー変更は不要です。
+
+2回目以降は、プロジェクトのフォルダで次のコマンドだけを実行します。
+
+```powershell
+.\.venv\Scripts\python.exe -m src.transfer "input.docx"
+```
+
+### 開発・テストする場合のみ
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt

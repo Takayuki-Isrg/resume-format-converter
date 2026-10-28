@@ -47,7 +47,7 @@ def test_multiple_projects_preserve_source_and_mask(tmp_path):
     assert extracted.projects[1].stages == "運用保守"
     output, warnings = convert(source, confirm=lambda _: "yes")
     text = output.read_text(encoding="utf-8")
-    assert re.fullmatch(r"職務経歴書_converted_\d{8}_\d{6}_\d{6}\.txt", output.name)
+    assert re.fullmatch(r"resume_converted_\d{8}_\d{6}_\d{6}\.txt", output.name)
     assert "山田" not in text and "sample@example.com" not in text and "090-1234-5678" not in text
     assert "[氏名]" in text and "[メールアドレス]" in text and "[電話番号]" in text
     assert text.count("単体テスト") == 2
@@ -230,3 +230,42 @@ def test_existing_timestamp_file_never_overwritten(tmp_path, monkeypatch):
     with pytest.raises(FileExistsError):
         convert(source, confirm=lambda _: pytest.fail("Must not prompt on collision"))
     assert destination.read_text(encoding="utf-8") == "既存ファイル"
+
+
+@pytest.mark.parametrize("field", ["name", "period", "overview", "duties", "stages", "technologies"])
+@pytest.mark.parametrize("configured", [False, True])
+def test_masking_precedes_formatting_for_every_output_field(tmp_path, monkeypatch, capsys, field, configured):
+    from src.readfiles import Project, Extraction
+    project = Project(name="架空案件", period="2025年1月～2025年2月（2ヶ月）")
+    original = "架空県架空市\n1-2-3" if configured else "通常の行\n住所：架空県架空市1-2-3\n生年月日：1990年1月2日"
+    setattr(project, field, original)
+    extraction = Extraction(projects=[project])
+    monkeypatch.setattr("src.transfer.read_projects", lambda _: extraction)
+    config = {"addresses": [original]} if configured else {}
+    source = tmp_path / "架空太郎.docx"
+    def approve(_):
+        terminal = capsys.readouterr().out
+        preview = terminal.split("保存予定の全文:\n", 1)[1]
+        assert "架空県" not in preview and "1990年" not in preview
+        return "yes"
+    output, _ = convert(source, config=config, confirm=approve)
+    text = output.read_text(encoding="utf-8")
+    assert "架空県" not in text and "1990年" not in text
+    assert "[住所]" in text
+    if not configured:
+        assert "[生年月日]" in text
+    assert getattr(project, field) == original  # Do not mutate extracted data.
+    assert "架空太郎" not in output.name
+
+
+def test_cli_completion_does_not_echo_personal_filename_or_directory(tmp_path, monkeypatch, capsys):
+    directory = tmp_path / "架空太郎の書類"
+    directory.mkdir()
+    source = directory / "架空太郎.docx"
+    make_docx(source, [["", "架空案件", "", "", ""]])
+    monkeypatch.setattr("builtins.input", lambda _: "yes")
+    assert main([str(source)]) == 0
+    completion = capsys.readouterr().out.split("変換完了:", 1)[1]
+    assert "架空太郎" not in completion
+    outputs = list(directory.glob("resume_converted_*.txt"))
+    assert len(outputs) == 1

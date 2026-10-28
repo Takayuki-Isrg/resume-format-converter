@@ -1,5 +1,6 @@
 """Run with python -m src.transfer input.docx."""
 import argparse
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -77,7 +78,7 @@ def mask_text(text: str, names=(), config=None, detections=None) -> str:
 
 def build_output_path(path: Path) -> Path:
     timestamp = datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d_%H%M%S_%f")
-    return path.with_name(f"{path.stem}_converted_{timestamp}.txt")
+    return path.with_name(f"resume_converted_{timestamp}.txt")
 
 
 def convert(path: str | Path, names=(), *, config=None, confirm=None):
@@ -87,9 +88,16 @@ def convert(path: str | Path, names=(), *, config=None, confirm=None):
     output = build_output_path(path)
     if output.exists():
         raise FileExistsError
-    blocks = [format_project(p) for p in result.projects]
     detections = []
-    text = mask_text("\n\n".join(blocks) + "\n", [*result.names, *names], config, detections)
+    blocks = []
+    for project in result.projects:
+        # Mask the original fields before presentation changes newlines or labels.
+        fields = {
+            field: mask_text(getattr(project, field), [*result.names, *names], config, detections)
+            for field in ("name", "period", "overview", "duties", "stages", "technologies")
+        }
+        blocks.append(format_project(replace(project, **fields)))
+    text = "\n\n".join(blocks) + "\n"
     result.warnings.append("マスク漏れの可能性があります。企業名・顧客名・案件名は自動判定でマスクしません。最終出力を確認してください。")
     for warning in result.warnings:
         print(f"警告: {warning}", file=sys.stderr)
@@ -129,7 +137,7 @@ def main(argv=None):
         print(f"エラー: {detail}", file=sys.stderr)
         return 1
     if output is not None:
-        print(f"変換完了: {output}")
+        print(f"変換完了: {output.name}（入力ファイルと同じフォルダ）")
     return 0
 
 

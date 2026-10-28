@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+*.env
+credentials.json
+token.json
+*.key
+*.docx
+*.doc
+*.pdf
+*_converted.txt
+*_converted_*.txt
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Private masking configuration (only the empty template is public)
+*.json
+!mask-config.example.json
+private/

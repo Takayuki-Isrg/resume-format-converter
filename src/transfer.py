@@ -1,4 +1,3 @@
-"""Run with python -m src.transfer input.docx."""
 import argparse
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -37,7 +36,6 @@ def load_mask_config(path=None):
 
 
 def mask_text(text: str, names=(), config=None, detections=None) -> str:
-    """Shared masking pipeline; optional detections are for terminal review only."""
     config = config or {}
 
     def record(category, value):

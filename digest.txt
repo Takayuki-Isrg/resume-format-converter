@@ -1,0 +1,1591 @@
+Directory structure:
+└── takayuki-isrg-summarize_resume/
+    ├── README.md
+    ├── conftest.py
+    ├── convert_to_pdf.py
+    ├── gui.py
+    ├── llm_client.py
+    ├── llm_provider.py
+    ├── ocr.py
+    ├── pytest.ini
+    ├── requirements-dev.txt
+    ├── requirements.txt
+    ├── run.ps1
+    ├── run_summary.bat
+    ├── scout_mail.py
+    ├── setup.ps1
+    ├── summarize_resume.py
+    ├── summary_with_sources.py
+    ├── .env.example
+    └── tests/
+        ├── test_llm_client.py
+        ├── test_llm_provider.py
+        └── test_resume_processing.py
+
+================================================
+FILE: README.md
+================================================
+[Binary file]
+
+
+================================================
+FILE: conftest.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: convert_to_pdf.py
+================================================
+Error reading file with 'cp932': 'cp932' codec can't decode byte 0x86 in position 1242: illegal multibyte sequence
+
+
+================================================
+FILE: gui.py
+================================================
+Error reading file with 'cp932': 'cp932' codec can't decode byte 0x84 in position 1762: illegal multibyte sequence
+
+
+================================================
+FILE: llm_client.py
+================================================
+Error reading file with 'cp932': 'cp932' codec can't decode byte 0x84 in position 1124: illegal multibyte sequence
+
+
+================================================
+FILE: llm_provider.py
+================================================
+Error reading file with 'cp932': 'cp932' codec can't decode byte 0x98 in position 1579: illegal multibyte sequence
+
+
+================================================
+FILE: ocr.py
+================================================
+import argparse
+import logging
+import os
+import shutil
+import subprocess
+import sys
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
+
+from PIL import Image
+
+from llm_provider import LLMClient, build_llm_client, get_provider, resolve_model
+from summarize_resume import (
+    build_parser as build_summary_parser,
+    extract_text_from_pdf,
+    maybe_copy,
+    maybe_save,
+    normalize_text,
+    sanitize_text,
+    summarize_text,
+    validate_inputs,
+)
+# スカウト媒体向けスカウトメール作成
+from scout_mail import (
+    DEFAULT_CANDIDATE_ACTION as DEFAULT_SCOUT_CANDIDATE_ACTION,
+    DEFAULT_DESIRED_LOCATIONS as DEFAULT_SCOUT_DESIRED_LOCATIONS,
+    DEFAULT_DESIRED_ROLES as DEFAULT_SCOUT_DESIRED_ROLES,
+    DEFAULT_POSITION as DEFAULT_SCOUT_POSITION,
+    DEFAULT_TONE as DEFAULT_SCOUT_TONE,
+    DEFAULT_WORK_LOCATION as DEFAULT_SCOUT_WORK_LOCATION,
+    ScoutMailRequest,
+    generate_scout_mail,
+    read_text_file,
+)
+
+
+LOG_PATH = Path(__file__).with_name("sharex_resume.log")
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+PDF_EXTENSION = ".pdf"
+DEFAULT_MIN_TEXT_CHARS = 200
+
+
+@dataclass(frozen=True)
+class ResumeProcessingResult:
+    summary_text: str
+    output_path: Path
+    extracted_text: str
+    sanitized_text: str
+    ocr_pdf_path: Path | None = None
+
+
+@contextmanager
+def timed_step(logger: logging.Logger, label: str):
+    start = perf_counter()
+    logger.info("開始: %s", label)
+    try:
+        yield
+    finally:
+        logger.info("処理時間: %s %.2f秒", label, perf_counter() - start)
+
+
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger("sharex_resume")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+def build_parser() -> argparse.ArgumentParser:
+    summary_parser = build_summary_parser()
+
+    parser = argparse.ArgumentParser(
+        description="ShareX のキャプチャ結果から、OCR・要約まで一括実行します。"
+    )
+    parser.add_argument("input_path", help="ShareX から渡される画像または PDF のパス")
+    parser.add_argument(
+        "--model",
+        default=summary_parser.get_default("model"),
+        help="使用するモデル名。未指定時は選択中のプロバイダーの <PROVIDER>_MODEL 環境変数を使用します。",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=summary_parser.get_default("prompt"),
+        help="要約用のカスタムプロンプト。未指定時は summarize_resume.py の既定値を使います。",
+    )
+    parser.add_argument(
+        "--save",
+        help="要約結果を保存する .txt ファイルパス。未指定時は OCR PDF と同じ場所に保存します。",
+    )
+    parser.add_argument(
+        "--copy",
+        action="store_true",
+        help="要約結果をクリップボードにもコピーします。",
+    )
+    parser.add_argument(
+        "--scout-mail",
+        action="store_true",
+        help="要約結果をもとにスカウトメールも生成します。",
+    )
+    parser.add_argument(
+        "--mail-save",
+        help="スカウトメールを保存する .txt ファイルパス。未指定時は OCR PDF と同じ場所に保存します。",
+    )
+    parser.add_argument(
+        "--copy-mail",
+        action="store_true",
+        help="生成したスカウトメールをクリップボードにもコピーします。",
+    )
+    parser.add_argument(
+        "--company-name",
+        default=os.getenv("SCOUT_COMPANY_NAME", ""),
+        help="スカウトメールに入れる会社名。環境変数 SCOUT_COMPANY_NAME でも指定できます。",
+    )
+    parser.add_argument(
+        "--position",
+        default=os.getenv("SCOUT_POSITION", DEFAULT_SCOUT_POSITION),
+        help="募集ポジション名。環境変数 SCOUT_POSITION でも指定できます。",
+    )
+    parser.add_argument(
+        "--candidate-action",
+        default=os.getenv("SCOUT_CANDIDATE_ACTION", DEFAULT_SCOUT_CANDIDATE_ACTION),
+        help="候補者の媒体上アクション。既定値: 気になる",
+    )
+    parser.add_argument(
+        "--desired-roles",
+        default=os.getenv("SCOUT_DESIRED_ROLES", DEFAULT_SCOUT_DESIRED_ROLES),
+        help="候補者の希望職種。既定値: 営業職",
+    )
+    parser.add_argument(
+        "--desired-locations",
+        default=os.getenv("SCOUT_DESIRED_LOCATIONS", DEFAULT_SCOUT_DESIRED_LOCATIONS),
+        help="候補者の希望勤務地。既定値: 東京",
+    )
+    parser.add_argument(
+        "--work-location",
+        default=os.getenv("SCOUT_WORK_LOCATION", DEFAULT_SCOUT_WORK_LOCATION),
+        help="文面で触れる勤務地。既定値: 東京",
+    )
+    parser.add_argument(
+        "--sender-name",
+        default=os.getenv("SCOUT_SENDER_NAME", ""),
+        help="送信者名。環境変数 SCOUT_SENDER_NAME でも指定できます。",
+    )
+    parser.add_argument(
+        "--job-context",
+        default=os.getenv("SCOUT_JOB_CONTEXT", ""),
+        help="求人・会社側の補足情報。環境変数 SCOUT_JOB_CONTEXT でも指定できます。",
+    )
+    parser.add_argument(
+        "--job-context-file",
+        default=os.getenv("SCOUT_JOB_CONTEXT_FILE", ""),
+        help="求人・会社側の補足情報を記載したテキストファイル。",
+    )
+    parser.add_argument(
+        "--mail-tone",
+        default=os.getenv("SCOUT_TONE", DEFAULT_SCOUT_TONE),
+        help="スカウトメールの文面トーン。環境変数 SCOUT_TONE でも指定できます。",
+    )
+    parser.add_argument(
+        "--language",
+        default="jpn",
+        help="ocrmypdf に渡す OCR 言語。既定値: jpn",
+    )
+    parser.add_argument(
+        "--keep-intermediate",
+        action="store_true",
+        help="中間生成物の PDF を残します。",
+    )
+    parser.add_argument(
+        "--min-text-chars",
+        type=int,
+        default=DEFAULT_MIN_TEXT_CHARS,
+        help=(
+            "PDFから抽出できたテキストを十分とみなす最小文字数。"
+            f"既定値: {DEFAULT_MIN_TEXT_CHARS}"
+        ),
+    )
+    return parser
+
+
+def detect_input_kind(input_path: Path) -> str:
+    suffix = input_path.suffix.lower()
+    if suffix == PDF_EXTENSION:
+        return "pdf"
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+
+    supported = ", ".join(sorted([PDF_EXTENSION, *IMAGE_EXTENSIONS]))
+    raise SystemExit(
+        f"対応していない入力形式です: {input_path.suffix or '(拡張子なし)'}。"
+        f"対応形式: {supported}"
+    )
+
+
+def build_output_base_path(input_path: Path) -> Path:
+    if (
+        input_path.suffix.lower() == PDF_EXTENSION
+        and input_path.name.lower().endswith(".ocr.pdf")
+    ):
+        return input_path
+    return input_path.with_name(f"{input_path.stem}.ocr.pdf")
+
+
+def convert_to_pdf(input_path: Path, logger: logging.Logger) -> tuple[Path, bool]:
+    if input_path.suffix.lower() == ".pdf":
+        logger.info("入力は PDF のため、PDF 変換をスキップします: %s", input_path)
+        return input_path, False
+
+    output_pdf = input_path.with_suffix(".pdf")
+    logger.info("画像を PDF に変換します: %s -> %s", input_path, output_pdf)
+
+    with Image.open(input_path) as image:
+        rgb_image = image.convert("RGB")
+        rgb_image.save(output_pdf, "PDF")
+
+    logger.info("PDF 変換が完了しました: %s", output_pdf)
+    return output_pdf, True
+
+
+def run_ocr(input_pdf: Path, language: str, logger: logging.Logger) -> Path:
+    output_pdf = input_pdf.with_name(f"{input_pdf.stem}.ocr.pdf")
+    exe_candidate = Path(sys.executable).with_name("ocrmypdf.exe")
+    module_command = [
+        sys.executable,
+        "-m",
+        "ocrmypdf",
+        "--force-ocr",
+        "--language",
+        language,
+        str(input_pdf),
+        str(output_pdf),
+    ]
+    exe_command = [
+        str(exe_candidate),
+        "--force-ocr",
+        "--language",
+        language,
+        str(input_pdf),
+        str(output_pdf),
+    ]
+
+    if shutil.which("ocrmypdf"):
+        command = [
+            "ocrmypdf",
+            "--force-ocr",
+            "--language",
+            language,
+            str(input_pdf),
+            str(output_pdf),
+        ]
+        logger.info("PATH 上の ocrmypdf を使用します")
+    elif exe_candidate.exists():
+        command = exe_command
+        logger.info("venv 内の ocrmypdf.exe を使用します: %s", exe_candidate)
+    else:
+        command = module_command
+        logger.info("python -m ocrmypdf を使用します: %s", sys.executable)
+
+    logger.info("OCR を開始します: %s", " ".join(command))
+    result = subprocess.run(command, capture_output=True, text=True)
+    logger.info("ocrmypdf 終了コード: %s", result.returncode)
+    if result.stdout.strip():
+        logger.info("ocrmypdf stdout:\n%s", result.stdout.strip())
+    if result.stderr.strip():
+        logger.info("ocrmypdf stderr:\n%s", result.stderr.strip())
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "OCR に失敗しました。"
+        if "OCR engine does not have language data" in message:
+            raise SystemExit(
+                "OCRエンジンに日本語の言語データが入っていません。"
+                f"指定言語: {language}。"
+                "Tesseract の日本語データを追加するか、--language eng のように利用可能な言語へ変更してください。"
+            )
+        raise SystemExit(f"ocrmypdf の実行に失敗しました: {message}")
+
+    logger.info("OCR 済み PDF を生成しました: %s", output_pdf)
+    return output_pdf
+
+
+def find_tesseract_command(logger: logging.Logger) -> list[str]:
+    command = shutil.which("tesseract")
+    if command:
+        logger.info("PATH 上の tesseract を使用します: %s", command)
+        return [command]
+
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    candidate = Path(program_files) / "Tesseract-OCR" / "tesseract.exe"
+    if candidate.exists():
+        logger.info("Tesseract OCR の標準インストール先を使用します: %s", candidate)
+        return [str(candidate)]
+
+    raise SystemExit(
+        "tesseract.exe が見つかりません。Tesseract OCR をインストールし、"
+        "PATH に追加するか C:\\Program Files\\Tesseract-OCR\\tesseract.exe に配置してください。"
+    )
+
+
+def run_image_ocr(input_image: Path, language: str, logger: logging.Logger) -> str:
+    command = [
+        *find_tesseract_command(logger),
+        str(input_image),
+        "stdout",
+        "-l",
+        language,
+    ]
+    logger.info("画像OCRを開始します: %s", " ".join(command))
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    logger.info("tesseract 終了コード: %s", result.returncode)
+    if result.stderr.strip():
+        logger.info("tesseract stderr:\n%s", result.stderr.strip())
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "画像OCRに失敗しました。"
+        if "Error opening data file" in message or "Failed loading language" in message:
+            raise SystemExit(
+                "Tesseract に指定言語のデータが入っていません。"
+                f"指定言語: {language}。"
+                "jpn.traineddata を追加するか、--language eng のように利用可能な言語へ変更してください。"
+            )
+        raise SystemExit(f"画像OCRに失敗しました: {message}")
+
+    text = normalize_text(result.stdout)
+    if not text:
+        raise SystemExit(f"画像からテキストを抽出できませんでした: {input_image}")
+    logger.info("画像OCRテキスト文字数: %s", len(text))
+    return f"[Page 1]\n{text}"
+
+
+def try_extract_pdf_text(
+    pdf_path: Path,
+    min_text_chars: int,
+    logger: logging.Logger,
+) -> str:
+    try:
+        extracted_text = extract_text_from_pdf(pdf_path)
+    except SystemExit as exc:
+        logger.info("PDFテキスト抽出をスキップしてOCRへ進みます: %s", exc)
+        return ""
+
+    text_length = len(extracted_text.strip())
+    logger.info("PDF抽出テキスト文字数: %s", text_length)
+    if text_length < min_text_chars:
+        logger.info(
+            "PDF抽出テキストが閾値未満のためOCRへ進みます: %s < %s",
+            text_length,
+            min_text_chars,
+        )
+        return ""
+
+    logger.info("PDFから十分なテキストを抽出できたためOCRをスキップします")
+    return extracted_text
+
+
+def extract_pdf_text_after_ocr(pdf_path: Path, min_text_chars: int, logger: logging.Logger) -> str:
+    extracted_text = extract_text_from_pdf(pdf_path)
+    text_length = len(extracted_text.strip())
+    logger.info("OCR後PDF抽出テキスト文字数: %s", text_length)
+    if text_length < min_text_chars:
+        logger.info(
+            "OCR後の抽出テキストが閾値未満です。取得できたテキストで処理を続行します: %s < %s",
+            text_length,
+            min_text_chars,
+        )
+    return extracted_text
+
+
+def summarize_ocr_pdf(
+    pdf_path: Path, llm_client: LLMClient, model: str, prompt: str, logger: logging.Logger
+) -> tuple[str, str, str]:
+    logger.info("要約対象 PDF を検証します: %s", pdf_path)
+    validate_inputs(pdf_path)
+
+    logger.info("PDF からテキストを抽出します")
+    extracted_text = extract_text_from_pdf(pdf_path)
+    logger.info("抽出テキスト文字数: %s", len(extracted_text))
+
+    summary_text, sanitized_text = summarize_extracted_text(
+        extracted_text,
+        llm_client,
+        model,
+        prompt,
+        logger,
+    )
+    return summary_text, extracted_text, sanitized_text
+
+
+def summarize_extracted_text(
+    extracted_text: str,
+    llm_client: LLMClient,
+    model: str,
+    prompt: str,
+    logger: logging.Logger,
+) -> tuple[str, str]:
+    with timed_step(logger, "個人情報マスク"):
+        logger.info("sanitize を実行します")
+        sanitized_text = sanitize_text(extracted_text)
+        logger.info("sanitize 後文字数: %s", len(sanitized_text))
+
+    with timed_step(logger, "経歴要約生成"):
+        logger.info(
+            "%s API に要約リクエストを送信します。model=%s", llm_client.provider, model
+        )
+        summary_text = summarize_text(llm_client, model, prompt, sanitized_text)
+        logger.info("要約取得完了。文字数: %s", len(summary_text))
+
+    return summary_text, sanitized_text
+
+
+def build_job_context(inline_context: str, context_file: str, logger: logging.Logger) -> str:
+    file_context = read_text_file(context_file)
+    if context_file:
+        logger.info("求人補足情報ファイルを読み込みました: %s", context_file)
+    return f"{inline_context}\n\n{file_context}".strip()
+
+
+def generate_mail_from_summary(
+    summary_text: str,
+    sanitized_text: str,
+    args: argparse.Namespace,
+    llm_client: LLMClient,
+    model: str,
+    logger: logging.Logger,
+) -> str:
+    job_context = build_job_context(args.job_context, args.job_context_file, logger)
+    request = ScoutMailRequest(
+        candidate_summary=summary_text,
+        sanitized_resume_text=sanitized_text,
+        company_name=args.company_name,
+        position=args.position,
+        sender_name=args.sender_name,
+        job_context=job_context,
+        candidate_action=args.candidate_action,
+        desired_roles=args.desired_roles,
+        desired_locations=args.desired_locations,
+        work_location=args.work_location,
+        tone=args.mail_tone,
+    )
+
+    with timed_step(logger, "スカウトメール生成"):
+        logger.info(
+            "%s API にスカウトメール生成リクエストを送信します。model=%s",
+            llm_client.provider,
+            model,
+        )
+        scout_mail = generate_scout_mail(llm_client, model, request)
+        logger.info("スカウトメール取得完了。文字数: %s", len(scout_mail))
+    return scout_mail
+
+
+def process_resume_file(
+    input_path: Path,
+    *,
+    llm_client: LLMClient,
+    model: str,
+    prompt: str,
+    language: str = "jpn",
+    min_text_chars: int = DEFAULT_MIN_TEXT_CHARS,
+    output_path: Path | None = None,
+    logger: logging.Logger | None = None,
+) -> ResumeProcessingResult:
+    """Run the OCR-to-summary pipeline shared by the CLI and GUI."""
+    logger = logger or setup_logger()
+    input_path = input_path.expanduser().resolve()
+    if not input_path.exists():
+        raise SystemExit(f"入力ファイルが見つかりません: {input_path}")
+    if not input_path.is_file():
+        raise SystemExit(f"ファイルではありません: {input_path}")
+
+    input_kind = detect_input_kind(input_path)
+    logger.info("入力ファイル: %s (%s)", input_path, input_kind)
+    ocr_pdf_path: Path | None = None
+    output_base_path = build_output_base_path(input_path)
+
+    if input_kind == "image":
+        with timed_step(logger, "画像OCR"):
+            extracted_text = run_image_ocr(input_path, language, logger)
+    else:
+        with timed_step(logger, "PDFテキスト抽出"):
+            extracted_text = try_extract_pdf_text(input_path, min_text_chars, logger)
+        if not extracted_text:
+            with timed_step(logger, "PDF OCR"):
+                ocr_pdf_path = run_ocr(input_path, language, logger)
+            output_base_path = ocr_pdf_path
+            with timed_step(logger, "OCR済みPDFテキスト抽出"):
+                extracted_text = extract_pdf_text_after_ocr(
+                    ocr_pdf_path, min_text_chars, logger
+                )
+
+    summary_text, sanitized_text = summarize_extracted_text(
+        extracted_text,
+        llm_client,
+        model,
+        prompt,
+        logger,
+    )
+    maybe_save(extracted_text, str(output_base_path.with_suffix(".ocrtext.txt")))
+    maybe_save(sanitized_text, str(output_base_path.with_suffix(".sanitized.txt")))
+
+    summary_path = output_path or output_base_path.with_suffix(".summary.txt")
+    maybe_save(summary_text, str(summary_path))
+    return ResumeProcessingResult(
+        summary_text=summary_text,
+        output_path=summary_path,
+        extracted_text=extracted_text,
+        sanitized_text=sanitized_text,
+        ocr_pdf_path=ocr_pdf_path,
+    )
+
+
+def main() -> None:
+    logger = setup_logger()
+    logger.info("========== ShareX OCR/要約 開始 ==========")
+    overall_start = perf_counter()
+
+    try:
+        parser = build_parser()
+        args = parser.parse_args()
+        if args.copy_mail or args.mail_save:
+            args.scout_mail = True
+
+        provider = get_provider()
+        model = resolve_model(provider, args.model)
+        llm_client = build_llm_client(provider)
+
+        logger.info(
+            "引数: input_path=%s, provider=%s, model=%s, copy=%s, scout_mail=%s, copy_mail=%s, language=%s, save=%s, mail_save=%s, keep_intermediate=%s, min_text_chars=%s",
+            args.input_path,
+            provider,
+            model,
+            args.copy,
+            args.scout_mail,
+            args.copy_mail,
+            args.language,
+            args.save,
+            args.mail_save,
+            args.keep_intermediate,
+            args.min_text_chars,
+        )
+
+        input_path = Path(args.input_path)
+
+        result = process_resume_file(
+            input_path,
+            llm_client=llm_client,
+            model=model,
+            prompt=args.prompt,
+            language=args.language,
+            min_text_chars=args.min_text_chars,
+            output_path=Path(args.save) if args.save else None,
+            logger=logger,
+        )
+
+        summary_text = result.summary_text
+        sanitized_text = result.sanitized_text
+        output_txt = result.output_path
+        ocr_pdf_path = result.ocr_pdf_path
+        output_base_path = ocr_pdf_path or build_output_base_path(input_path.resolve())
+
+        if args.copy:
+            logger.info("要約をクリップボードへコピーします")
+        maybe_copy(summary_text, args.copy)
+
+        scout_mail_text = ""
+        mail_output_txt = None
+        if args.scout_mail:
+            scout_mail_text = generate_mail_from_summary(
+                summary_text,
+                sanitized_text,
+                args,
+                llm_client,
+                model,
+                logger,
+            )
+            mail_output_txt = (
+                Path(args.mail_save)
+                if args.mail_save
+                else output_base_path.with_suffix(".scout-mail.txt")
+            )
+            with timed_step(logger, "スカウトメール保存"):
+                logger.info("スカウトメールを保存します: %s", mail_output_txt)
+                maybe_save(scout_mail_text, str(mail_output_txt))
+
+            if args.copy_mail:
+                logger.info("スカウトメールをクリップボードへコピーします")
+            maybe_copy(scout_mail_text, args.copy_mail)
+
+        logger.info("処理が正常終了しました")
+        print(summary_text)
+        print(f"\n要約保存先: {output_txt}")
+        if args.scout_mail:
+            print("\n--- スカウトメール ---")
+            print(scout_mail_text)
+            print(f"\nスカウトメール保存先: {mail_output_txt}")
+        if ocr_pdf_path:
+            print(f"OCR PDF: {ocr_pdf_path}")
+        else:
+            print("OCR PDF: 生成なし（PDFテキスト抽出または画像直接OCR）")
+    except Exception as exc:
+        logger.exception("処理中にエラーが発生しました: %s", exc)
+        print(
+            "エラーが発生しました。詳細は "
+            f"{LOG_PATH} を確認してください。"
+        )
+        raise
+    finally:
+        logger.info("処理時間: 全体 %.2f秒", perf_counter() - overall_start)
+        logger.info("========== ShareX OCR/要約 終了 ==========\n")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: pytest.ini
+================================================
+[pytest]
+pythonpath = .
+testpaths = tests
+
+
+
+================================================
+FILE: requirements-dev.txt
+================================================
+-r requirements.txt
+pytest==9.1.1
+
+
+
+================================================
+FILE: requirements.txt
+================================================
+PyMuPDF==1.27.2.2
+pillow==12.2.0
+openai==2.32.0
+pyperclip==1.11.0
+ocrmypdf==17.4.2
+PySide6==6.9.2
+
+
+
+================================================
+FILE: run.ps1
+================================================
+param(
+    [Parameter(Position = 0)]
+    [string]$PdfPath,
+
+    [string]$Model,
+
+    [string]$Save,
+
+    [switch]$Copy,
+
+    [string]$Prompt
+)
+
+$ErrorActionPreference = "Stop"
+
+$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $projectRoot
+
+if ([string]::IsNullOrWhiteSpace($PdfPath)) {
+    throw "PDFファイルのパスを指定してください。例: .\run.ps1 .\resume.pdf"
+}
+
+if (-not (Test-Path $PdfPath -PathType Leaf)) {
+    throw "PDFファイルが見つかりません: $PdfPath"
+}
+
+if ([System.IO.Path]::GetExtension($PdfPath).ToLowerInvariant() -ne ".pdf") {
+    throw "PDFファイルを指定してください: $PdfPath"
+}
+
+$activateScript = Join-Path $projectRoot ".venv\Scripts\Activate.ps1"
+if (-not (Test-Path $activateScript)) {
+    throw "仮想環境が見つかりません。先に .\setup.ps1 を実行してください。"
+}
+
+. $activateScript
+
+$entryPoint = Join-Path $projectRoot "main.py"
+if (-not (Test-Path $entryPoint)) {
+    $entryPoint = Join-Path $projectRoot "summarize_resume.py"
+}
+
+if (-not (Test-Path $entryPoint)) {
+    throw "実行ファイルが見つかりません: main.py または summarize_resume.py"
+}
+
+$argsList = @($entryPoint, $PdfPath)
+
+if (-not [string]::IsNullOrWhiteSpace($Model)) {
+    $argsList += @("--model", $Model)
+}
+
+if (-not [string]::IsNullOrWhiteSpace($Save)) {
+    $argsList += @("--save", $Save)
+}
+
+if ($Copy) {
+    $argsList += "--copy"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($Prompt)) {
+    $argsList += @("--prompt", $Prompt)
+}
+
+python @argsList
+
+
+
+================================================
+FILE: run_summary.bat
+================================================
+@echo off
+setlocal
+
+cd /d C:\Python\summarize_resume || goto :done
+call .venv\Scripts\activate.bat
+
+REM If ShareX passes a captured image, use it directly.
+if not "%~1"=="" (
+    set "input=%~1"
+    goto :run
+)
+
+REM Without an argument, use the latest OCR PDF in the current ShareX month folder.
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM"') do set "YM=%%i"
+set "DIR=%USERPROFILE%\Documents\ShareX\Screenshots\%YM%"
+echo DIR=%DIR%
+
+for /f "delims=" %%i in ('dir "%DIR%\*.ocr.pdf" /b /a-d /o-d 2^>nul') do (
+    set "input=%DIR%\%%i"
+    goto :run
+)
+
+echo File not found: %DIR%\*.ocr.pdf
+goto :done
+
+:run
+echo input=%input%
+
+for %%F in ("%input%") do set "ext=%%~xF"
+
+REM Images and non-OCR PDFs must go through OCR before summary/scout mail.
+if /I not "%ext%"==".pdf" goto :run_ocr
+if /I not "%input:~-8%"==".ocr.pdf" goto :run_ocr
+goto :run_existing_ocr_pdf
+
+:run_ocr
+python ocr.py "%input%" --scout-mail
+goto :done
+
+:run_existing_ocr_pdf
+python summarize_resume.py "%input%"
+if errorlevel 1 goto :done
+python scout_mail.py "%input%"
+goto :done
+
+:done
+pause
+
+
+
+================================================
+FILE: scout_mail.py
+================================================
+from __future__ import annotations
+
+import argparse
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+from llm_provider import LLMClient, build_llm_client, get_provider, resolve_model
+from summarize_resume import (
+    DEFAULT_PROMPT as RESUME_SUMMARY_PROMPT,
+    extract_text_from_pdf,
+    maybe_copy,
+    maybe_save,
+    sanitize_text,
+    summarize_text,
+    validate_inputs,
+)
+from llm_client import generate_text, validate_llm_config
+
+
+DEFAULT_CANDIDATE_ACTION = "気になる"
+DEFAULT_POSITION = "営業"
+DEFAULT_DESIRED_ROLES = "営業"
+DEFAULT_DESIRED_LOCATIONS = "東京"
+DEFAULT_WORK_LOCATION = "東京"
+DEFAULT_TONE = "感謝 → 共感 → 軽い提案。フラットで丁寧、押し売り感は出さない"
+TEXT_ENCODINGS = ("utf-8", "utf-8-sig", "cp932")
+MAX_RESUME_CONTEXT_CHARS = 12000
+
+DEFAULT_PROMPT = """\
+あなたはスカウト媒体運用に精通した採用担当者です。
+入力される候補者情報は、OCR済みレジュメから抽出し、個人連絡先をマスク済みの情報です。
+
+以下の条件を満たす「スカウト媒体で“気になる”などのリアクションをしてくれたユーザー向けスカウトメール文面」を作成してください。
+
+【前提】
+- 媒体: スカウト媒体
+- 対象: 「気になる」または入力された候補者アクションをしてくれたユーザー
+- 手動作成の対象媒体は現状スカウト媒体のみ
+- PG/SE希望ユーザーからの「いいね」は少ないため、営業職向けを標準にする
+- 目的:
+  - 「興味を持ってくれてありがとう」という姿勢を伝える
+  - 警戒心を下げ、「一度話を聞いてみようかな」と思ってもらう
+- トーン:
+  - 感謝 → 共感 → 軽い提案、の流れ
+  - フラットで丁寧、押し売り感は出さない
+- 文字数:
+  - 通常スカウトよりやや短め
+  - スマホで読んでも負担にならない分量
+
+【必ず盛り込む内容】
+1. 冒頭で候補者アクションをしてくれたことへのお礼
+2. なぜ連絡したのか（希望職種・志向とポジションの接点）
+3. 営業職の簡単な特徴・魅力
+   - お客様との関係性
+   - 提案の幅や裁量
+4. 勤務地で働くイメージが湧く一言
+5. 応募ではなく、まずは情報交換・カジュアル面談でもOKという安心感
+6. 相手の意思を尊重する締め方（返信の自由度を明示）
+
+【表現上の注意】
+- 「スカウト感」より「リアクションへのお返事」に近い温度感
+- 上から目線・選考感は出さない
+- スカウト媒体でよくある定型文っぽさを避ける
+- 候補者アクション欄が「いいね」の場合は、件名・本文も「いいね」に合わせる
+- 氏名・メールアドレス・電話番号・住所などの個人連絡先には触れない
+- レジュメに書かれていない経験・スキル・志向性を推測で補完しない
+- 会社名・職種・募集背景・待遇など、入力されていない情報を断定しない
+- 過度な賛辞、煽り、押し付ける表現は避ける
+- 日程調整や面談提案の文脈でも「面接」という文言は使わない
+
+出力形式:
+件名: ...
+
+本文:
+...
+"""
+
+
+@dataclass(frozen=True)
+class ScoutMailRequest:
+    candidate_summary: str
+    sanitized_resume_text: str = ""
+    company_name: str = ""
+    position: str = DEFAULT_POSITION
+    sender_name: str = ""
+    job_context: str = ""
+    candidate_action: str = DEFAULT_CANDIDATE_ACTION
+    desired_roles: str = DEFAULT_DESIRED_ROLES
+    desired_locations: str = DEFAULT_DESIRED_LOCATIONS
+    work_location: str = DEFAULT_WORK_LOCATION
+    tone: str = DEFAULT_TONE
+
+
+def _value_or_not_set(value: str) -> str:
+    cleaned = value.strip()
+    return cleaned if cleaned else "未指定"
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    cleaned = text.strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rstrip() + "\n\n[以降は文字数上限のため省略]"
+
+
+def build_user_prompt(request: ScoutMailRequest) -> str:
+    resume_context = _truncate_text(
+        request.sanitized_resume_text,
+        MAX_RESUME_CONTEXT_CHARS,
+    )
+
+    return f"""\
+以下の情報をもとに、スカウトメールを作成してください。
+
+【会社名】
+{_value_or_not_set(request.company_name)}
+
+【募集ポジション】
+{_value_or_not_set(request.position)}
+
+【候補者アクション】
+{_value_or_not_set(request.candidate_action)}
+
+【候補者の希望職種】
+{_value_or_not_set(request.desired_roles)}
+
+【候補者の希望勤務地】
+{_value_or_not_set(request.desired_locations)}
+
+【文面で触れる勤務地】
+{_value_or_not_set(request.work_location)}
+
+【送信者名】
+{_value_or_not_set(request.sender_name)}
+
+【文面トーン】
+{_value_or_not_set(request.tone)}
+
+【求人・会社側の補足情報】
+{_value_or_not_set(request.job_context)}
+
+【候補者サマリー】
+{request.candidate_summary.strip()}
+
+【候補者レジュメ本文（連絡先マスク済み。根拠確認用）】
+{resume_context if resume_context else "未指定"}
+"""
+
+
+def generate_scout_mail(
+    llm_client: LLMClient,
+    model: str,
+    request: ScoutMailRequest,
+    prompt: str = DEFAULT_PROMPT,
+) -> str:
+    return llm_client.complete(model, prompt, build_user_prompt(request))
+
+
+def read_text_file(path: str | None) -> str:
+    if not path:
+        return ""
+    return read_text_path(Path(path).expanduser().resolve())
+
+
+def read_text_path(path: Path) -> str:
+    if path.suffix.lower() == ".pdf":
+        raise SystemExit(
+            "PDFはテキストファイルとして読み込めません。"
+            f"要約テキストではなくPDFを指定した可能性があります: {path}"
+        )
+
+    data = path.read_bytes()
+    for encoding in TEXT_ENCODINGS:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    encodings = ", ".join(TEXT_ENCODINGS)
+    raise SystemExit(
+        f"テキストファイルの文字コードを判定できませんでした: {path}\n"
+        f"対応している文字コード: {encodings}"
+    )
+
+
+def build_summary_from_pdf(llm_client: LLMClient, model: str, pdf_path: Path) -> tuple[str, str]:
+    validate_inputs(pdf_path)
+    extracted_text = extract_text_from_pdf(pdf_path)
+    sanitized_text = sanitize_text(extracted_text)
+    summary_text = summarize_text(
+        llm_client,
+        model,
+        RESUME_SUMMARY_PROMPT,
+        sanitized_text,
+    )
+    return summary_text, sanitized_text
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="候補者要約テキストまたはOCR済みPDFからスカウトメールを生成します。"
+    )
+    parser.add_argument(
+        "source_path",
+        help="候補者要約テキスト、またはOCR済みPDFのパス",
+    )
+    parser.add_argument(
+        "--resume-text-path",
+        help="根拠確認用のレジュメ本文テキスト。未指定でも生成できます。",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="使用するモデル名。未指定時は選択中のプロバイダーの <PROVIDER>_MODEL 環境変数を使用します。",
+    )
+    parser.add_argument(
+        "--company-name",
+        default=os.getenv("SCOUT_COMPANY_NAME", ""),
+        help="メール本文に入れる会社名。環境変数 SCOUT_COMPANY_NAME でも指定できます。",
+    )
+    parser.add_argument(
+        "--position",
+        default=os.getenv("SCOUT_POSITION", DEFAULT_POSITION),
+        help="募集ポジション名。環境変数 SCOUT_POSITION でも指定できます。",
+    )
+    parser.add_argument(
+        "--candidate-action",
+        default=os.getenv("SCOUT_CANDIDATE_ACTION", DEFAULT_CANDIDATE_ACTION),
+        help="候補者の媒体上アクション。既定値: 気になる",
+    )
+    parser.add_argument(
+        "--desired-roles",
+        default=os.getenv("SCOUT_DESIRED_ROLES", DEFAULT_DESIRED_ROLES),
+        help="候補者の希望職種。既定値: 営業職",
+    )
+    parser.add_argument(
+        "--desired-locations",
+        default=os.getenv("SCOUT_DESIRED_LOCATIONS", DEFAULT_DESIRED_LOCATIONS),
+        help="候補者の希望勤務地。既定値: 東京",
+    )
+    parser.add_argument(
+        "--work-location",
+        default=os.getenv("SCOUT_WORK_LOCATION", DEFAULT_WORK_LOCATION),
+        help="文面で触れる勤務地。既定値: 東京",
+    )
+    parser.add_argument(
+        "--sender-name",
+        default=os.getenv("SCOUT_SENDER_NAME", ""),
+        help="送信者名。環境変数 SCOUT_SENDER_NAME でも指定できます。",
+    )
+    parser.add_argument(
+        "--job-context",
+        default=os.getenv("SCOUT_JOB_CONTEXT", ""),
+        help="求人・会社側の補足情報。環境変数 SCOUT_JOB_CONTEXT でも指定できます。",
+    )
+    parser.add_argument(
+        "--job-context-file",
+        default=os.getenv("SCOUT_JOB_CONTEXT_FILE", ""),
+        help="求人・会社側の補足情報を記載したテキストファイル。",
+    )
+    parser.add_argument(
+        "--tone",
+        default=os.getenv("SCOUT_TONE", DEFAULT_TONE),
+        help="文面トーン。環境変数 SCOUT_TONE でも指定できます。",
+    )
+    parser.add_argument(
+        "--save",
+        help="スカウトメールの保存先。未指定時は要約と同じ場所に .scout-mail.txt を作ります。",
+    )
+    parser.add_argument(
+        "--summary-save",
+        help="PDFから生成した候補者要約の保存先。PDF入力時のみ使います。",
+    )
+    parser.add_argument(
+        "--copy",
+        action="store_true",
+        help="生成したスカウトメールをクリップボードにもコピーします。",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    provider = get_provider()
+    model = resolve_model(provider, args.model)
+    llm_client = build_llm_client(provider)
+
+    source_path = Path(args.source_path).expanduser().resolve()
+    if not source_path.exists():
+        raise SystemExit(f"入力ファイルが見つかりません: {source_path}")
+
+    job_context = args.job_context
+    file_context = read_text_file(args.job_context_file)
+    if file_context:
+        job_context = f"{job_context}\n\n{file_context}".strip()
+
+    if source_path.suffix.lower() == ".pdf":
+        candidate_summary, sanitized_resume_text = build_summary_from_pdf(
+            llm_client,
+            model,
+            source_path,
+        )
+        summary_output_path = (
+            Path(args.summary_save)
+            if args.summary_save
+            else source_path.with_suffix(".summary.txt")
+        )
+        maybe_save(candidate_summary, str(summary_output_path))
+    else:
+        candidate_summary = read_text_path(source_path)
+        sanitized_resume_text = read_text_file(args.resume_text_path)
+
+    request = ScoutMailRequest(
+        candidate_summary=candidate_summary,
+        sanitized_resume_text=sanitized_resume_text,
+        company_name=args.company_name,
+        position=args.position,
+        sender_name=args.sender_name,
+        job_context=job_context,
+        candidate_action=args.candidate_action,
+        desired_roles=args.desired_roles,
+        desired_locations=args.desired_locations,
+        work_location=args.work_location,
+        tone=args.tone,
+    )
+
+    scout_mail = generate_scout_mail(llm_client, model, request)
+
+    output_path = (
+        Path(args.save) if args.save else source_path.with_suffix(".scout-mail.txt")
+    )
+    maybe_save(scout_mail, str(output_path))
+    maybe_copy(scout_mail, args.copy)
+
+    print(scout_mail)
+    print(f"\nスカウトメール保存先: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: setup.ps1
+================================================
+$ErrorActionPreference = "Stop"
+
+function Get-PythonCommand {
+    $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyLauncher) {
+        & py -3.11.9 --version *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return @{ Command = "py"; Arguments = @("-3.11.9") }
+        }
+
+        & py -3 --version *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return @{ Command = "py"; Arguments = @("-3") }
+        }
+    }
+
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) {
+        & python --version *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return @{ Command = "python"; Arguments = @() }
+        }
+    }
+
+    throw "Python が見つかりません。README の手順に従って Python 3.11.9 をインストールしてください。"
+}
+
+$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $projectRoot
+
+$python = Get-PythonCommand
+Write-Host "Python を確認しました:"
+& $python.Command @($python.Arguments + @("--version"))
+
+$venvPath = Join-Path $projectRoot ".venv"
+if (-not (Test-Path $venvPath)) {
+    Write-Host "仮想環境を作成します: .venv"
+    & $python.Command @($python.Arguments + @("-m", "venv", ".venv"))
+}
+else {
+    Write-Host "仮想環境は作成済みです: .venv"
+}
+
+$venvPython = Join-Path $venvPath "Scripts\python.exe"
+if (-not (Test-Path $venvPython)) {
+    throw "仮想環境の Python が見つかりません: $venvPython"
+}
+
+Write-Host "pip を更新します。"
+& $venvPython -m pip install --upgrade pip
+
+$requirements = Join-Path $projectRoot "requirements.txt"
+if (Test-Path $requirements) {
+    Write-Host "requirements.txt をインストールします。"
+    & $venvPython -m pip install -r $requirements
+}
+else {
+    Write-Host "requirements.txt が見つからないため、依存関係のインストールをスキップします。"
+}
+
+$envExample = Join-Path $projectRoot ".env.example"
+if (Test-Path $envExample) {
+    Write-Host ".env.example があります。必要に応じて .env にコピーし、値を設定してください。"
+    Write-Host "例: Copy-Item .env.example .env"
+}
+else {
+    Write-Host ".env.example はありません。OpenAI を使う場合は OPENAI_API_KEY を環境変数に設定してください。"
+}
+
+Write-Host "セットアップ完了。実行例: .\run.ps1 .\sample.pdf"
+
+
+
+================================================
+FILE: summarize_resume.py
+================================================
+[Binary file]
+
+
+================================================
+FILE: summary_with_sources.py
+================================================
+[Binary file]
+
+
+================================================
+FILE: .env.example
+================================================
+# このファイルを .env にコピーし、実際の値を設定してください（.env はGit管理対象外です）。
+# 例: Copy-Item .env.example .env
+
+# 使用するプロバイダー: openai / local / orcarouter
+LLM_PROVIDER=openai
+
+# OpenAI
+OPENAI_API_KEY=
+OPENAI_MODEL=
+
+# ローカルLLM（Ollama）
+LOCAL_LLM_BASE_URL=http://localhost:11434/v1
+LOCAL_LLM_API_KEY=ollama
+LOCAL_LLM_MODEL=
+
+# OrcaRouter
+ORCAROUTER_API_KEY=
+ORCAROUTER_BASE_URL=https://api.orcarouter.ai/v1
+ORCAROUTER_MODEL=orcarouter/auto
+
+
+
+================================================
+FILE: tests/test_llm_client.py
+================================================
+import os
+import unittest
+from unittest.mock import patch
+
+from llm_client import generate_text, load_llm_config
+
+
+class _Message:
+    content = "  要約結果  "
+
+
+class _Completion:
+    choices = [type("Choice", (), {"message": _Message()})]
+
+
+class _Completions:
+    def create(self, **kwargs):
+        self.kwargs = kwargs
+        return _Completion()
+
+
+class LLMClientTest(unittest.TestCase):
+    def test_local_defaults_to_ollama_compatible_endpoint(self):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "local"}, clear=True):
+            config = load_llm_config()
+        self.assertEqual(config.base_url, "http://localhost:11434/v1")
+        self.assertEqual(config.api_key, "local")
+
+    def test_openrouter_uses_its_key_and_endpoint(self):
+        with patch.dict(
+            os.environ,
+            {"LLM_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "test-key"},
+            clear=True,
+        ):
+            config = load_llm_config()
+        self.assertEqual(config.base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(config.api_key, "test-key")
+
+    def test_generate_text_uses_chat_completions(self):
+        completions = _Completions()
+        client = type(
+            "Client",
+            (),
+            {"chat": type("Chat", (), {"completions": completions})()},
+        )()
+        result = generate_text(client, "model", "system", "user")
+        self.assertEqual(result, "要約結果")
+        self.assertEqual(completions.kwargs["model"], "model")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+================================================
+FILE: tests/test_llm_provider.py
+================================================
+import pytest
+
+import llm_provider
+from llm_provider import (
+    LLMClient,
+    build_llm_client,
+    get_provider,
+    resolve_model,
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_dotenv_loading(monkeypatch):
+    # .env の実ファイル読み込みをテストから遮断し、os.environ の状態だけに依存させる。
+    monkeypatch.setattr(llm_provider, "_ENV_LOADED", True)
+
+
+@pytest.fixture(autouse=True)
+def _clean_provider_env(monkeypatch):
+    for key in [
+        "LLM_PROVIDER",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+        "LOCAL_LLM_BASE_URL",
+        "LOCAL_LLM_API_KEY",
+        "LOCAL_LLM_MODEL",
+        "ORCAROUTER_API_KEY",
+        "ORCAROUTER_BASE_URL",
+        "ORCAROUTER_MODEL",
+    ]:
+        monkeypatch.delenv(key, raising=False)
+
+
+class FakeOpenAI:
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        FakeOpenAI.last_kwargs = kwargs
+
+
+@pytest.fixture
+def fake_openai_sdk(monkeypatch):
+    FakeOpenAI.last_kwargs = None
+    monkeypatch.setattr(llm_provider, "_require_openai_sdk", lambda: FakeOpenAI)
+    return FakeOpenAI
+
+
+# --- get_provider ---
+
+
+def test_get_provider_defaults_to_openai():
+    assert get_provider() == "openai"
+
+
+def test_get_provider_reads_env(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "local")
+    assert get_provider() == "local"
+
+
+def test_get_provider_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "OrcaRouter")
+    assert get_provider() == "orcarouter"
+
+
+def test_get_provider_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "bogus")
+    with pytest.raises(SystemExit):
+        get_provider()
+
+
+# --- resolve_model ---
+
+
+def test_resolve_model_prefers_cli_value():
+    assert resolve_model("openai", "gpt-4.1-mini") == "gpt-4.1-mini"
+
+
+def test_resolve_model_falls_back_to_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-4.1")
+    assert resolve_model("openai", None) == "gpt-4.1"
+
+
+def test_resolve_model_orcarouter_has_builtin_default():
+    assert resolve_model("orcarouter", None) == "orcarouter/auto"
+
+
+def test_resolve_model_raises_clear_error_when_unset():
+    with pytest.raises(SystemExit, match="LOCAL_LLM_MODEL"):
+        resolve_model("local", None)
+
+
+# --- build_llm_client ---
+
+
+def test_build_llm_client_raises_when_api_key_missing(fake_openai_sdk):
+    with pytest.raises(SystemExit, match="ORCAROUTER_API_KEY"):
+        build_llm_client("orcarouter")
+
+
+def test_build_llm_client_openai_uses_default_base_url(monkeypatch, fake_openai_sdk):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    client = build_llm_client("openai")
+
+    assert client.provider == "openai"
+    assert client.api_style == "responses"
+    assert fake_openai_sdk.last_kwargs == {"api_key": "sk-test"}
+
+
+def test_build_llm_client_local_uses_configured_base_url(monkeypatch, fake_openai_sdk):
+    monkeypatch.setenv("LOCAL_LLM_API_KEY", "ollama")
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://localhost:11434/v1")
+    client = build_llm_client("local")
+
+    assert client.api_style == "chat_completions"
+    assert fake_openai_sdk.last_kwargs == {
+        "api_key": "ollama",
+        "base_url": "http://localhost:11434/v1",
+    }
+
+
+def test_build_llm_client_orcarouter_falls_back_to_default_base_url(
+    monkeypatch, fake_openai_sdk
+):
+    monkeypatch.setenv("ORCAROUTER_API_KEY", "or-test")
+    client = build_llm_client("orcarouter")
+
+    assert client.api_style == "chat_completions"
+    assert fake_openai_sdk.last_kwargs == {
+        "api_key": "or-test",
+        "base_url": "https://api.orcarouter.ai/v1",
+    }
+
+
+# --- LLMClient.complete ---
+
+
+class FakeResponsesClient:
+    def __init__(self, output_text):
+        self.responses = self
+        self._output_text = output_text
+        self.last_call = None
+
+    def create(self, **kwargs):
+        self.last_call = kwargs
+        return type("Response", (), {"output_text": self._output_text})()
+
+
+class FakeChatCompletionsClient:
+    def __init__(self, content):
+        self.chat = self
+        self.completions = self
+        self._content = content
+        self.last_call = None
+
+    def create(self, **kwargs):
+        self.last_call = kwargs
+        message = type("Message", (), {"content": self._content})()
+        choice = type("Choice", (), {"message": message})()
+        return type("Response", (), {"choices": [choice]})()
+
+
+def test_complete_uses_responses_api_for_openai_style():
+    fake_client = FakeResponsesClient(" 要約結果 \n")
+    llm_client = LLMClient(provider="openai", api_style="responses", client=fake_client)
+
+    result = llm_client.complete("gpt-4.1-mini", "system prompt", "user prompt")
+
+    assert result == "要約結果"
+    assert fake_client.last_call["model"] == "gpt-4.1-mini"
+
+
+def test_complete_uses_chat_completions_for_local_and_orcarouter_style():
+    fake_client = FakeChatCompletionsClient(" スカウトメール \n")
+    llm_client = LLMClient(
+        provider="orcarouter", api_style="chat_completions", client=fake_client
+    )
+
+    result = llm_client.complete("orcarouter/auto", "system prompt", "user prompt")
+
+    assert result == "スカウトメール"
+    assert fake_client.last_call["messages"] == [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "user prompt"},
+    ]
+
+
+
+================================================
+FILE: tests/test_resume_processing.py
+================================================
+import logging
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from ocr import process_resume_file
+
+
+def test_process_resume_file_reuses_pdf_pipeline_and_saves_summary(tmp_path):
+    source = tmp_path / "resume.pdf"
+    source.write_bytes(b"dummy")
+    logger = logging.getLogger("test_process_resume_file")
+    llm_client=Mock(),
+
+    with (
+        patch("ocr.try_extract_pdf_text", return_value="[Page 1]\n経歴"),
+        patch("ocr.summarize_extracted_text", return_value=("要約結果", "経歴")),
+    ):
+        result = process_resume_file(
+            source,
+            model="test-model",
+            prompt="test-prompt",
+            llm_client=llm_client,
+            logger=logger,
+        )
+
+    assert result.summary_text == "要約結果"
+    assert result.output_path == Path(tmp_path / "resume.ocr.summary.txt")
+    assert result.output_path.read_text(encoding="utf-8") == "要約結果"
+
+

@@ -10,7 +10,7 @@ W = "{" + NS["w"] + "}"
 
 
 class ResumeReadError(ValueError):
-    """The input cannot be interpreted safely as project records."""
+    """入力内容を、プロジェクトの記録として安全に解釈することはできません。(The input cannot be interpreted safely as project records.)"""
 
 
 @dataclass
@@ -62,7 +62,8 @@ def split_content(text):
             sections[current].append(line)
     return ["\n".join(sections[key]).strip() for key in ("name", "overview", "duties")]
 
-
+# Word（.docx）内部のXMLを読み取り、表の列見出しを元に、
+# 各案件の期間、プロジェクト名、担当業務、使用技術などを取得
 def read_projects(path: str | Path) -> Extraction:
     path = Path(path)
     if path.suffix.lower() != ".docx":
